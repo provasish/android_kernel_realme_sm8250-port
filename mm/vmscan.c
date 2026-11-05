@@ -3958,13 +3958,13 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
 			break;
 
 		/* the caller might be holding the lock for write */
-		if (down_read_trylock(&mm->mmap_sem)) {
+		if (mmap_read_trylock(mm)) {
 			unsigned long start = walk->next_addr;
 			unsigned long end = mm->highest_vm_end;
 
 			err = walk_page_range(start, end, &args);
 
-			up_read(&mm->mmap_sem);
+			mmap_read_unlock(mm);
 
 			if (walk->batched) {
 				spin_lock_irq(&pgdat->lru_lock);
@@ -3992,6 +3992,16 @@ static void free_mm_walk(struct lru_gen_mm_walk *walk)
 {
 	if (!current->reclaim_state || !current->reclaim_state->mm_walk)
 		kfree(walk);
+}
+
+/*
+ * pgdat->mm_walk has room for one user, but multi-kswapd can run several
+ * threads per node. The others get NULL here, which makes alloc_mm_walk()
+ * allocate a private walk or fall back to iterate_mm_list_nowalk().
+ */
+static struct lru_gen_mm_walk *kswapd_mm_walk(struct pglist_data *pgdat)
+{
+	return current == pgdat->kswapd[0] ? &pgdat->mm_walk : NULL;
 }
 
 static void inc_min_seq(struct lruvec *lruvec)
@@ -4284,7 +4294,7 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 	sc->memcgs_need_swapping = true;
 	sc->memcgs_avoid_swapping = true;
 
-	current->reclaim_state->mm_walk = &pgdat->mm_walk;
+	current->reclaim_state->mm_walk = kswapd_mm_walk(pgdat);
 
 	memcg = mem_cgroup_iter(NULL, NULL, NULL);
 	do {
@@ -4826,7 +4836,7 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 	blk_start_plug(&plug);
 
 	if (current_is_kswapd())
-		current->reclaim_state->mm_walk = &pgdat->mm_walk;
+		current->reclaim_state->mm_walk = kswapd_mm_walk(pgdat);
 
 	while (true) {
 		int delta;
