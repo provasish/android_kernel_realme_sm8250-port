@@ -1040,6 +1040,15 @@ typedef enum {
 	SUBBOARD_NTC_NORMAL
 } SUBBOARD_NTC_ABNORMAL_STATUS;
 
+typedef enum {
+	PLC_STATUS_NOT_SUPPORT = 0,
+	PLC_STATUS_NOT_ALLOW,
+	PLC_STATUS_DISABLE,
+	PLC_STATUS_ENABLE,
+	PLC_STATUS_WAIT,
+	PLC_STATUS_MAX,
+} PLC_STATUS_TYPE;
+
 #define AGING1_STAGE_CYCLE	500
 #define AGING2_STAGE_CYCLE	1000
 
@@ -1118,6 +1127,11 @@ struct oplus_chg_chip {
 	struct alarm usbtemp_alarm_timer;
 	struct work_struct usbtemp_restart_work;
 	struct delayed_work parallel_chg_mos_test_work;
+	int plc_status;
+	int curr_plc_status;
+	bool plc_support;
+	struct delayed_work plc_disable_wait_work;
+	struct delayed_work plc_unplug_check_work;
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0))
 	struct wake_lock suspend_lock;
 #else
@@ -1835,6 +1849,7 @@ int oplus_chg_get_notify_flag(void);
 int oplus_is_vooc_project(void);
 
 int oplus_chg_show_vooc_logo_ornot(void);
+int oplus_plc_based_buck_setting(struct oplus_chg_chip *chip, int enable);
 
 bool get_otg_switch(void);
 

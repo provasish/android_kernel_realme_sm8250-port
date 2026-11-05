@@ -2341,6 +2341,7 @@ board_temp-usr {
 			qcom,vooc_project = <7>;
 			qcom,vbatt_num = <2>;
 			qcom,ffc_support;
+			oplus,plc_support;
 			qcom,dual_ffc;
 			qcom,nightstandby_support;
 			//recharge_after_full;

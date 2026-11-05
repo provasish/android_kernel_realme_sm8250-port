@@ -221,6 +221,8 @@ static void oplus_chg_panel_notify_reg_work(struct work_struct *work);
 #endif
 int oplus_chg_get_curr_time_ms(unsigned long *time_ms);
 static void oplus_fg_soft_reset_work(struct work_struct *work);
+static void oplus_plc_disable_wait_work(struct work_struct *work);
+static void oplus_plc_unplug_check_work(struct work_struct *work);
 static void oplus_comm_check_fgreset(struct oplus_chg_chip *chip);
 static void oplus_comm_fginfo_reset(struct oplus_chg_chip *chip);
 
@@ -253,6 +255,9 @@ bool __attribute__((weak)) oplus_is_ptcrb_version(void)
 
 /****************************************/
 #define RESET_MCU_DELAY_30S 6
+#define PLC_DISABLE_WAIT_DELAY 1000
+#define PLC_REENABLE_HOLD_MS 8000
+#define PLC_UNPLUG_CHECK_DELAY 15000
 static int reset_mcu_delay = 0;
 static bool mcu_update = false;
 static int efttest_count = 1;
@@ -1103,7 +1108,13 @@ int oplus_battery_get_property(struct power_supply *psy, enum power_supply_prope
 					else
 						val->intval = chip->prop_status;
 				} else {
-					val->intval = chip->prop_status;
+					if (chip->plc_support &&
+					    (chip->curr_plc_status == PLC_STATUS_ENABLE ||
+					     chip->plc_status == PLC_STATUS_WAIT) &&
+					    chip->prop_status != POWER_SUPPLY_STATUS_FULL)
+						val->intval = POWER_SUPPLY_STATUS_CHARGING;
+					else
+						val->intval = chip->prop_status;
 				}
 				if (chip->tbatt_status == BATTERY_STATUS__HIGH_TEMP ||
 				    chip->tbatt_status == BATTERY_STATUS__LOW_TEMP ||
@@ -3981,6 +3992,8 @@ int oplus_chg_init(struct oplus_chg_chip *chip)
 	INIT_DELAYED_WORK(&chip->turn_on_charging_work, oplus_chg_turn_on_charging_work);
 	INIT_DELAYED_WORK(&chip->parallel_chg_mos_test_work, oplus_parallel_chg_mos_test_work);
 	INIT_DELAYED_WORK(&chip->fg_soft_reset_work, oplus_fg_soft_reset_work);
+	INIT_DELAYED_WORK(&chip->plc_disable_wait_work, oplus_plc_disable_wait_work);
+	INIT_DELAYED_WORK(&chip->plc_unplug_check_work, oplus_plc_unplug_check_work);
 	INIT_DELAYED_WORK(&chip->parallel_batt_chg_check_work, oplus_parallel_batt_chg_check_work);
 	INIT_DELAYED_WORK(&chip->soc_update_when_resume_work, oplus_chg_soc_update_when_resume_work);
 #if IS_ENABLED(CONFIG_DRM_PANEL_NOTIFY) || IS_ENABLED(CONFIG_OPLUS_CHG_DRM_PANEL_NOTIFY)
@@ -5745,6 +5758,7 @@ int oplus_chg_parse_charger_dt(struct oplus_chg_chip *chip)
 	chip->chg_ctrl_by_calling = of_property_read_bool(node, "qcom,chg_ctrl_by_calling");
 	chip->usbtemp_change_gap = of_property_read_bool(node, "qcom,usbtemp_change_gap");
 	chip->ffc_support = of_property_read_bool(node, "qcom,ffc_support");
+	chip->plc_support = of_property_read_bool(node, "oplus,plc_support");
 	chip->dual_ffc = of_property_read_bool(node, "qcom,dual_ffc");
 	chip->fg_info_package_read_support = of_property_read_bool(node, "qcom,fg_info_package_read_support");
 	chip->new_ui_warning_support = of_property_read_bool(node, "qcom,new_ui_warning_support");
@@ -8237,6 +8251,29 @@ void oplus_chg_variables_reset(struct oplus_chg_chip *chip, bool in)
 		if (oplus_chg_get_voocphy_support() == AP_SINGLE_CP_VOOCPHY ||
 		    oplus_chg_get_voocphy_support() == AP_DUAL_CP_VOOCPHY) {
 			oplus_voocphy_clear_variables();
+		}
+	}
+	if (chip->plc_support) {
+		if (in) {
+			/*
+			 * mmi_chg stays 0 across a plug-in, so an active session must keep
+			 * its state here. mmi_fastchg can already be back to 1 by now.
+			 */
+			if (chip->mmi_fastchg && chip->curr_plc_status != PLC_STATUS_ENABLE &&
+			    chip->curr_plc_status != PLC_STATUS_WAIT) {
+				chip->curr_plc_status = PLC_STATUS_DISABLE;
+				chip->plc_status = PLC_STATUS_DISABLE;
+			}
+		} else if (chip->mmi_fastchg) {
+			chip->curr_plc_status = PLC_STATUS_NOT_ALLOW;
+			chip->plc_status = PLC_STATUS_NOT_ALLOW;
+		} else if (chip->curr_plc_status == PLC_STATUS_ENABLE) {
+			/*
+			 * Leaving fast charge makes the adapter reconnect, so this may
+			 * not be a real unplug. Check again once that has settled.
+			 */
+			schedule_delayed_work(&chip->plc_unplug_check_work,
+					      msecs_to_jiffies(PLC_UNPLUG_CHECK_DELAY));
 		}
 	}
 	chip->pre_charger_exist = chip->charger_exist;
@@ -13289,6 +13326,72 @@ static void oplus_fg_soft_reset_work(struct work_struct *work)
 		chip->fg_check_ibat_cnt, chip->fg_soft_reset_fail_cnt);
 }
 
+int oplus_plc_based_buck_setting(struct oplus_chg_chip *chip, int enable)
+{
+	int rc = 0;
+
+	if (chip->plc_status == enable || !chip->plc_support)
+		return 0;
+
+	if (enable == PLC_STATUS_WAIT) {
+		chip->plc_status = PLC_STATUS_WAIT;
+		schedule_delayed_work(&chip->plc_disable_wait_work,
+				      msecs_to_jiffies(PLC_DISABLE_WAIT_DELAY));
+	} else {
+		if (chip->plc_status == PLC_STATUS_DISABLE && enable == PLC_STATUS_ENABLE) {
+			rc = mmi_charging_enable(chip, 0);
+			if (rc < 0)
+				return rc;
+		}
+		if (enable == PLC_STATUS_DISABLE && chip->plc_status == PLC_STATUS_WAIT) {
+			rc = mmi_charging_enable(chip, 1);
+			/* keep reporting charging while the adapter reconnects */
+			msleep(PLC_REENABLE_HOLD_MS);
+			if (chip->plc_status == PLC_STATUS_WAIT)
+				chip->plc_status = PLC_STATUS_DISABLE;
+		} else {
+			chip->plc_status = enable;
+		}
+	}
+
+	chg_info("enable=%d, plc_status=%d, mmi_chg=%d\n",
+		 enable, chip->plc_status, chip->mmi_chg);
+	return rc;
+}
+
+static void oplus_plc_disable_wait_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct oplus_chg_chip *chip = container_of(dwork, struct oplus_chg_chip, plc_disable_wait_work);
+
+	if (chip->curr_plc_status != PLC_STATUS_WAIT)
+		return;
+
+	if (!chip->charger_exist) {
+		/* charging must not stay off once the charger has gone */
+		mmi_charging_enable(chip, 1);
+		chip->curr_plc_status = PLC_STATUS_NOT_ALLOW;
+		oplus_plc_based_buck_setting(chip, PLC_STATUS_NOT_ALLOW);
+	} else {
+		chip->curr_plc_status = PLC_STATUS_DISABLE;
+		oplus_plc_based_buck_setting(chip, PLC_STATUS_DISABLE);
+	}
+}
+
+static void oplus_plc_unplug_check_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct oplus_chg_chip *chip = container_of(dwork, struct oplus_chg_chip, plc_unplug_check_work);
+
+	if (chip->charger_exist || chip->curr_plc_status != PLC_STATUS_ENABLE)
+		return;
+
+	chg_info("charger removed while plc enabled, restore charging\n");
+	mmi_charging_enable(chip, 1);
+	chip->curr_plc_status = PLC_STATUS_NOT_ALLOW;
+	chip->plc_status = PLC_STATUS_NOT_ALLOW;
+}
+
 static void oplus_chg_update_work(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
@@ -13674,6 +13777,11 @@ int oplus_chg_show_vooc_logo_ornot(void)
 #endif
 
 	if (oplus_chg_is_wls_fast_type() == true)
+		return 1;
+
+	if (g_charger_chip->plc_support &&
+	    (g_charger_chip->curr_plc_status == PLC_STATUS_ENABLE ||
+	     g_charger_chip->plc_status == PLC_STATUS_WAIT))
 		return 1;
 
 	if (oplus_voocphy_get_dual_cp_support() == false ||

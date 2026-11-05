@@ -3256,6 +3256,76 @@ static ssize_t chg_up_limit_show(struct device *dev, struct device_attribute *at
 
 DEVICE_ATTR_RW(chg_up_limit);
 
+static ssize_t plc_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct oplus_chg_chip *chip = NULL;
+	int counts = 0;
+
+	chip = (struct oplus_chg_chip *)dev_get_drvdata(oplus_battery_dir);
+	if (!chip) {
+		chg_err("chip is NULL\n");
+		return -EINVAL;
+	}
+
+	if (chip->plc_support)
+		counts = chip->curr_plc_status;
+
+	return sprintf(buf, "status=%d\n", counts);
+}
+
+static ssize_t plc_store(struct device *dev, struct device_attribute *attr, const char *buf,
+			 size_t count)
+{
+	int val = 0;
+	int rc = 0;
+	struct oplus_chg_chip *chip = NULL;
+	char key[64] = { 0 };
+
+	chip = (struct oplus_chg_chip *)dev_get_drvdata(oplus_battery_dir);
+	if (!chip) {
+		chg_err("chip is NULL\n");
+		return -EINVAL;
+	}
+
+	if (!chip->plc_support)
+		return -EINVAL;
+
+	if (sscanf(buf, "%63[^=]=%d", key, &val) != 2) {
+		chg_err("buf %s error\n", buf);
+		return -EINVAL;
+	}
+
+	if (sysfs_streq("switch", key)) {
+		if (strncmp(buf, "switch=1|callname=", 18) && strncmp(buf, "switch=0|callname=", 18)) {
+			chg_info("buf invalid: %s\n", buf);
+			return -EINVAL;
+		}
+		chg_info("buf=[%s], change switch to %d\n", buf, val);
+		if (chip->curr_plc_status == PLC_STATUS_ENABLE && !val) {
+			chip->curr_plc_status = PLC_STATUS_WAIT;
+			oplus_plc_based_buck_setting(chip, PLC_STATUS_WAIT);
+		} else if (chip->curr_plc_status == PLC_STATUS_DISABLE && val) {
+			/* still leaving the last session, charging would stay on */
+			if (chip->plc_status == PLC_STATUS_WAIT)
+				return -EBUSY;
+			rc = oplus_plc_based_buck_setting(chip, PLC_STATUS_ENABLE);
+			if (rc < 0)
+				return rc;
+			chip->curr_plc_status = PLC_STATUS_ENABLE;
+		}
+	} else if (sysfs_streq("adapter_support_mask", key)) {
+		chg_info("buf=[%s], change adapter_support_mask to %x\n", buf, val);
+		/* clearing this while active would leave charging off */
+		if (!val && (chip->curr_plc_status == PLC_STATUS_ENABLE ||
+			     chip->plc_status == PLC_STATUS_WAIT))
+			return -EBUSY;
+		chip->plc_support = !!val;
+	}
+
+	return count;
+}
+static DEVICE_ATTR_RW(plc);
+
 static ssize_t read_gauge_reg_store(struct device *dev,
 					struct device_attribute *attr,
 					const char *buf, size_t count)
@@ -3339,6 +3409,7 @@ static struct device_attribute *oplus_common_attributes[] = {
 	&dev_attr_device_power,
 	&dev_attr_cpa_power,
 	&dev_attr_chg_up_limit,
+	&dev_attr_plc,
 	&dev_attr_non_standard_chg_switch,
 	NULL
 };
